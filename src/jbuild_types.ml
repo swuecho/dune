@@ -294,13 +294,16 @@ module Lib_dep = struct
     | sexp ->
       of_sexp_error sexp "<library> or (select <module> from <libraries...>) expected"
 
-  let to_lib_names = function
-    | Direct s -> [s]
-    | Select s ->
-      List.concat_map s.choices ~f:(fun x ->
-        List.map x.lits ~f:(function
-          | Pos x -> x
-          | Neg x -> x))
+  let lib_names acc ts =
+    List.fold_left ts ~init:acc ~f:(fun acc t ->
+      match t with
+      | Direct s -> s :: acc
+      | Select s ->
+        List.fold_left s.choices ~init:acc ~f:(fun acc x ->
+          List.fold_left x.lits ~init:acc ~f:(fun acc x ->
+            (match x with
+             | Pos x -> x
+             | Neg x -> x) :: acc)))
 
   let direct s = Direct s
 end
@@ -497,12 +500,6 @@ module Library = struct
     match t.c_names, t.cxx_names, t.self_build_stubs_archive with
     | [], [], None -> false
     | _            -> true
-
-  let stubs_archive t ~dir ~ext_lib =
-    Path.relative dir (sprintf "lib%s_stubs%s" t.name ext_lib)
-
-  let all_lib_deps t =
-    List.map t.virtual_deps ~f:(fun s -> Lib_dep.Direct s) @ t.buildable.libraries
 end
 
 module Executables = struct

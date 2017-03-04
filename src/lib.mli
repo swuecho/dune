@@ -1,16 +1,33 @@
 open Import
 
-module Internal : sig
-  type t = Path.t * Jbuild_types.Library.t
-end
+type resolved_select =
+  { src_fn : string
+  ; dst_fn : string
+  }
 
 type t =
-  | Internal of Internal.t
+  | Internal of internal
   | External of Findlib.package
+
+and internal =
+  { name             : string
+  ; dir              : Path.t
+  ; optional         : bool
+  ; public_c_headers : string list
+  ; public           : Jbuild_types.Public_lib.t
+  ; best_name        : string (** Either [name] or [p.name] if public = [Some p] *)
+  ; has_stubs        : bool
+  ; requires         : t list
+  ; ppx_runtime_deps : t list
+  ; (** If resolution of dependencies failed, this is the failure *)
+    fail             : fail option
+  ; resolved_selects : resolved_select list
+  }
 
 module Set : Set.S with type elt := t
 
-(*val deps : t -> string list*)
+val requires : t -> t list
+val ppx_runtime_deps : t -> t list
 
 val header_files : t list -> Path.t list
 
@@ -30,6 +47,3 @@ val best_name : t -> string
 val describe : t -> string
 
 val remove_dups_preserve_order : t list -> t list
-
-(*val ppx_runtime_libraries : t list -> String_set.t
-*)

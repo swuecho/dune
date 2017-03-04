@@ -18,3 +18,6 @@ let system_shell =
          die "I need %s to %s but I couldn't find it :(\n\
               Who doesn't have %s%s??!"
            cmd needed_to cmd os })
+
+let stubs_archive ~dir ~libname ~ext_lib =
+  Path.relative dir (sprintf "lib%s_stubs%s" libname ext_lib)
