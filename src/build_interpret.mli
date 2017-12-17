@@ -18,6 +18,8 @@ module Rule : sig
     ; fallback : Jbuild.Rule.Fallback.t
     ; locks    : Path.t list
     ; loc      : Loc.t option
+    ; (** Directory where all the targets are produced *)
+      dir      : Path.t
     }
 
   val make
@@ -40,7 +42,7 @@ end
 (* must be called first *)
 val static_deps
   :  (_, _) Build.t
-  -> all_targets_by_dir:Path.Set.t Path.Map.t Lazy.t
+  -> all_targets:(dir:Path.t -> Path.Set.t)
   -> Static_deps.t
 
 val lib_deps

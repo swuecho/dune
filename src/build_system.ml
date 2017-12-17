@@ -117,25 +117,51 @@ module File_spec = struct
     T { rule; kind; data = None }
 end
 
+module Dir_status = struct
+  type waiting_for_load_dir =
+    { mutable lazy_generators : (unit -> unit) list }
+
+  type collection_stage =
+    | Loading
+    | Pending of waiting_for_load_dir
+
+  type rules_collector =
+    { mutable rules : Build_interpret.Rule.t list
+    ; mutable stage : collection_stage
+    }
+
+  type t =
+    | Collecting_rules of rules_collector
+    | Loaded of Pset.t (* set of targets in the directory *)
+end
+
 type t =
   { (* File specification by targets *)
-    files      : (Path.t, File_spec.packed) Hashtbl.t
-  ; contexts   : Context.t list
+    files       : (Path.t, File_spec.packed) Hashtbl.t
+  ; contexts    : Context.t list
   ; (* Table from target to digest of
        [(deps (filename + contents), targets (filename only), action)] *)
-    trace      : (Path.t, Digest.t) Hashtbl.t
+    trace       : (Path.t, Digest.t) Hashtbl.t
+  ; file_tree   : File_tree.t
   ; mutable local_mkdirs : Path.Local.Set.t
-  ; all_targets_by_dir : Pset.t Pmap.t Lazy.t
+  ; mutable dirs : (Path.t, Dir_status.t) Hashtbl.t
+  ; mutable gen_rules : (t -> dir:Path.t -> unit)
+  ; mutable load_dir_stack : Path.t list
   }
 
-let all_targets t = Hashtbl.fold t.files ~init:[] ~f:(fun ~key ~data:_ acc -> key :: acc)
+let set_rule_generator t ~f = t.gen_rules <- f
+
+let get_dir_status t ~dir =
+  Hashtbl.find_or_add t.dirs dir ~f:(fun _ ->
+    Dir_status.Collecting_rules
+      { rules = []
+      ; stage = Pending { lazy_generators = [] }
+      })
 
 let find_file_exn t file =
   Hashtbl.find_exn t.files file
     ~string_of_key:(fun fn -> sprintf "%S" (Path.to_string fn))
     ~table_desc:(fun _ -> "<target to rule>")
-
-let is_target t file = Hashtbl.mem t.files file
 
 module Build_error = struct
   type t =
@@ -175,62 +201,8 @@ let wrap_build_errors t ~f ~targeting =
       | Build_error.E _ -> reraise exn
       | exn -> Build_error.raise t exn ~targeting ~backtrace)
 
-let wait_for_file t fn ~targeting =
-  match Hashtbl.find t.files fn with
-  | None ->
-    if Path.is_in_build_dir fn then
-      die "no rule found for %s" (Utils.describe_target fn)
-    else if Path.exists fn then
-      return ()
-    else
-      die "file unavailable: %s" (Path.to_string fn)
-  | Some (File_spec.T file) ->
-    match file.rule.exec with
-    | Not_started { eval_rule; exec_rule } ->
-      file.rule.exec <- Starting { for_file = targeting };
-      let rule_evaluation =
-        wrap_build_errors t ~targeting:fn ~f:eval_rule
-      in
-      let rule_execution =
-        wrap_build_errors t ~targeting:fn ~f:(exec_rule rule_evaluation)
-      in
-      file.rule.exec <-
-        Running { for_file = targeting
-                ; rule_evaluation
-                ; rule_execution
-                };
-      rule_execution
-    | Running { rule_execution; _ } -> rule_execution
-    | Evaluating_rule { for_file; rule_evaluation; exec_rule } ->
-      file.rule.exec <- Starting { for_file = targeting };
-      let rule_execution =
-        wrap_build_errors t ~targeting:fn ~f:(exec_rule rule_evaluation)
-      in
-      file.rule.exec <-
-        Running { for_file
-                ; rule_evaluation
-                ; rule_execution
-                };
-      rule_execution
-    | Starting _ ->
-      (* Recursive deps! *)
-      let rec build_loop acc targeting =
-        let acc = targeting :: acc in
-        if fn = targeting then
-          acc
-        else
-          let (File_spec.T file) = find_file_exn t targeting in
-          match file.rule.exec with
-          | Not_started _ | Running _ | Evaluating_rule _ -> assert false
-          | Starting { for_file } ->
-            build_loop acc for_file
-      in
-      let loop = build_loop [fn] targeting in
-      die "Dependency cycle between the following files:\n    %s"
-        (String.concat ~sep:"\n--> "
-           (List.map loop ~f:Path.to_string))
-
 module Target = Build_interpret.Target
+module Pre_rule = Build_interpret.Rule
 
 let get_file : type a. t -> Path.t -> a File_kind.t -> a File_spec.t = fun t fn kind ->
   match Hashtbl.find t.files fn with
@@ -355,7 +327,15 @@ let create_file_specs t targets rule ~copy_source =
     | Target.Vfile (Vspec.T (fn, kind)) ->
       add_spec t fn (File_spec.create rule (Sexp_file kind)) ~copy_source)
 
-module Pre_rule = Build_interpret.Rule
+(* This contains the targets of the actions that are being executed. On exit, we need to
+   delete them as they might contain garbage *)
+let pending_targets = ref Pset.empty
+
+let () =
+  Future.Scheduler.at_exit_after_waiting_for_commands (fun () ->
+    let fns = !pending_targets in
+    pending_targets := Pset.empty;
+    Pset.iter fns ~f:Path.unlink_no_err)
 
 let clear_targets_digests_after_rule_execution targets =
   let missing =
@@ -371,20 +351,6 @@ let clear_targets_digests_after_rule_execution targets =
       (Pset.elements missing
        |> List.map ~f:(fun fn -> sprintf "- %s" (Path.to_string fn))
        |> String.concat ~sep:"\n")
-
-let wait_for_deps t deps ~targeting =
-  all_unit
-    (Pset.fold deps ~init:[] ~f:(fun fn acc -> wait_for_file t fn ~targeting :: acc))
-
-(* This contains the targets of the actions that are being executed. On exit, we need to
-   delete them as they might contain garbage *)
-let pending_targets = ref Pset.empty
-
-let () =
-  Future.Scheduler.at_exit_after_waiting_for_commands (fun () ->
-    let fns = !pending_targets in
-    pending_targets := Pset.empty;
-    Pset.iter fns ~f:Path.unlink_no_err)
 
 let make_local_dirs t paths =
   Pset.iter paths ~f:(fun path ->
@@ -419,7 +385,23 @@ let rec with_locks mutexes ~f =
       (Hashtbl.find_or_add locks m ~f:(fun _ -> Future.Mutex.create ()))
       (fun () -> with_locks mutexes ~f)
 
-let compile_rule t ~all_targets_by_dir ?(copy_source=false) pre_rule =
+let remove_old_artifacts t ~dir =
+  if not (Path.is_in_build_dir dir) || Hashtbl.mem t.files (Path.relative dir Config.jbuilder_keep_fname) then
+    ()
+  else
+    match Path.readdir dir with
+    | exception _ -> ()
+    | files ->
+      List.iter files ~f:(fun fn ->
+        let fn = Path.relative dir fn in
+        match Unix.lstat (Path.to_string fn) with
+        | { st_kind = S_DIR; _ } -> ()
+        | exception _ ->
+          if not (Hashtbl.mem t.files fn) then Path.unlink fn
+        | _ ->
+          if not (Hashtbl.mem t.files fn) then Path.unlink fn)
+
+let rec compile_rule t ?(copy_source=false) pre_rule =
   let { Pre_rule.
         context
       ; build
@@ -428,6 +410,7 @@ let compile_rule t ~all_targets_by_dir ?(copy_source=false) pre_rule =
       ; fallback
       ; locks
       ; loc
+      ; dir = _
       } =
     pre_rule
   in
@@ -435,7 +418,7 @@ let compile_rule t ~all_targets_by_dir ?(copy_source=false) pre_rule =
   let { Build_interpret.Static_deps.
         rule_deps
       ; action_deps = static_deps
-      } = Build_interpret.static_deps build ~all_targets_by_dir
+      } = Build_interpret.static_deps build ~all_targets:(load_dir t)
   in
 
   let eval_rule ~targeting =
@@ -542,26 +525,190 @@ let compile_rule t ~all_targets_by_dir ?(copy_source=false) pre_rule =
   in
   create_file_specs t target_specs rule ~copy_source
 
-let setup_copy_rules t ~all_non_target_source_files ~all_targets_by_dir =
-  List.iter t.contexts ~f:(fun (ctx : Context.t) ->
-    let ctx_dir = ctx.build_dir in
-    Pset.iter all_non_target_source_files ~f:(fun path ->
-      let ctx_path = Path.append ctx_dir path in
-      if is_target t ctx_path &&
-         String.is_suffix (Path.basename ctx_path) ~suffix:".install" then
-        (* Do not copy over .install files that are generated by a rule. *)
-        ()
-      else
-        let build = Build.copy ~src:path ~dst:ctx_path in
-        (* We temporarily allow overrides while setting up copy rules
-           from the source directory so that artifact that are already
-           present in the source directory are not re-computed.
+and setup_copy_rules t ~ctx_dir ~non_target_source_files =
+  Pset.iter non_target_source_files ~f:(fun path ->
+    let ctx_path = Path.append ctx_dir path in
+    if is_target t ctx_path &&
+       String.is_suffix (Path.basename ctx_path) ~suffix:".install" then
+      (* Do not copy over .install files that are generated by a rule. *)
+      ()
+    else
+      let build = Build.copy ~src:path ~dst:ctx_path in
+      (* We temporarily allow overrides while setting up copy rules
+         from the source directory so that artifact that are already
+         present in the source directory are not re-computed.
 
-           This allows to keep generated files in tarballs. Maybe we
-           should allow it on a case-by-case basis though.  *)
-        compile_rule t (Pre_rule.make build)
-          ~all_targets_by_dir
-          ~copy_source:true))
+         This allows to keep generated files in tarballs. Maybe we
+         should allow it on a case-by-case basis though. *)
+      compile_rule t (Pre_rule.make build) ~copy_source:true)
+
+and is_target t file =
+  Pset.mem file (load_dir t ~dir:(Path.parent file))
+
+and load_dir t ~dir =
+  match get_dir_status t ~dir with
+  | Loaded targets -> targets
+
+  | Collecting_rules collector ->
+    let lazy_generators =
+      match collector.stage with
+      | Loading ->
+        die "recursive dependency between directories:\n  %s"
+          (String.concat ~sep:"\n--> "
+             (List.map t.load_dir_stack ~f:Utils.describe_target))
+      | Pending { lazy_generators } ->
+        collector.stage <- Loading;
+        lazy_generators
+    in
+
+    collector.stage <- Loading;
+    t.load_dir_stack <- dir :: t.load_dir_stack;
+    List.iter lazy_generators ~f:(fun f -> f ());
+
+    (* Load all the rules *)
+    t.gen_rules t ~dir;
+    let rules = collector.rules in
+
+    (* Compute the set of targets and files to copy *)
+    let user_rule_targets =
+      List.fold_left rules ~init:Pset.empty ~f:(fun acc { Pre_rule.targets; _ } ->
+        List.fold_left targets ~init:acc ~f:(fun acc target ->
+          let path = Target.path target in
+          Pset.add path acc))
+    in
+    let targets, to_copy =
+      match Path.extract_build_context_dir dir with
+      | None ->
+        let files =
+          if Path.is_local dir then
+            File_tree.files_of t.file_tree dir
+          else
+            match Path.readdir dir with
+            | exception _ -> Path.Set.empty
+            | files ->
+              Pset.of_list (List.map files ~f:(Path.relative dir))
+        in
+        (Pset.union user_rule_targets files, None)
+      | Some (ctx_path, path) ->
+        let files = File_tree.files_of t.file_tree path in
+        if Pset.is_empty files then
+          (user_rule_targets, None)
+        else
+          (Pset.union user_rule_targets
+             (Pset.map files ~f:(Path.append ctx_path)),
+           Some (ctx_path, files))
+    in
+
+    (* Set the directory status to loaded *)
+    Hashtbl.replace t.dirs ~key:dir ~data:(Loaded targets);
+    (match t.load_dir_stack with
+     | [] -> assert false
+     | x :: l ->
+       t.load_dir_stack <- l;
+       assert (x = dir));
+
+    (* Compile the rules *)
+    List.iter rules ~f:(compile_rule t ~copy_source:false);
+    Option.iter to_copy ~f:(fun (ctx_dir, source_files) ->
+      setup_copy_rules t ~ctx_dir ~non_target_source_files:source_files);
+    remove_old_artifacts t ~dir;
+    (let l = !disabled_fallback_rules in
+     disabled_fallback_rules := [];
+     List.iter l ~f:(fun rule ->
+       let disabled_for =
+         match rule.Internal_rule.fallback with
+         | No | Not_possible -> assert false
+         | Yes paths -> paths
+       in
+       let leftover_targets = Pset.diff rule.targets disabled_for in
+       if not (Pset.is_empty leftover_targets) then begin
+         let list_paths set =
+           Pset.elements set
+           |> List.map ~f:(fun p -> sprintf "- %s"
+                                      (Path.to_string_maybe_quoted
+                                         (Path.drop_optional_build_context p)))
+           |> String.concat ~sep:"\n"
+         in
+         Loc.fail (Internal_rule.loc rule ~dir:(Path.parent (Pset.choose leftover_targets)))
+           "\
+Some of the targets of this fallback rule are present in the source tree,
+and some are not. This is not allowed. Either none of the targets must
+be present in the source tree, either they must all be.
+
+The following targets are present:
+%s
+
+The following targets are not:
+%s
+"
+           (list_paths disabled_for)
+           (list_paths leftover_targets)
+       end
+     ));
+    targets
+
+and load_dir_unit t ~dir = ignore (load_dir t ~dir : Pset.t)
+
+and wait_for_file t fn ~targeting =
+  let dir = Path.parent fn in
+  if Path.is_local dir then load_dir_unit t ~dir;
+  match Hashtbl.find t.files fn with
+  | None ->
+    if Path.is_in_build_dir fn then
+      die "no rule found for %s" (Utils.describe_target fn)
+    else if Path.exists fn then
+      return ()
+    else
+      die "file unavailable: %s" (Path.to_string fn)
+  | Some (File_spec.T file) ->
+    match file.rule.exec with
+    | Not_started { eval_rule; exec_rule } ->
+      file.rule.exec <- Starting { for_file = targeting };
+      let rule_evaluation =
+        wrap_build_errors t ~targeting:fn ~f:eval_rule
+      in
+      let rule_execution =
+        wrap_build_errors t ~targeting:fn ~f:(exec_rule rule_evaluation)
+      in
+      file.rule.exec <-
+        Running { for_file = targeting
+                ; rule_evaluation
+                ; rule_execution
+                };
+      rule_execution
+    | Running { rule_execution; _ } -> rule_execution
+    | Evaluating_rule { for_file; rule_evaluation; exec_rule } ->
+      file.rule.exec <- Starting { for_file = targeting };
+      let rule_execution =
+        wrap_build_errors t ~targeting:fn ~f:(exec_rule rule_evaluation)
+      in
+      file.rule.exec <-
+        Running { for_file
+                ; rule_evaluation
+                ; rule_execution
+                };
+      rule_execution
+    | Starting _ ->
+      (* Recursive deps! *)
+      let rec build_loop acc targeting =
+        let acc = targeting :: acc in
+        if fn = targeting then
+          acc
+        else
+          let (File_spec.T file) = find_file_exn t targeting in
+          match file.rule.exec with
+          | Not_started _ | Running _ | Evaluating_rule _ -> assert false
+          | Starting { for_file } ->
+            build_loop acc for_file
+      in
+      let loop = build_loop [fn] targeting in
+      die "Dependency cycle between the following files:\n    %s"
+        (String.concat ~sep:"\n--> "
+           (List.map loop ~f:Path.to_string))
+
+and wait_for_deps t deps ~targeting =
+  all_unit
+    (Pset.fold deps ~init:[] ~f:(fun fn acc -> wait_for_file t fn ~targeting :: acc))
 
 module Trace = struct
   type t = (Path.t, Digest.t) Hashtbl.t
@@ -603,131 +750,35 @@ let all_targets_ever_built () =
   else
     []
 
+let all_targets t =
+  List.iter t.contexts ~f:(fun ctx ->
+    File_tree.fold t.file_tree ~traverse_ignored_dirs:true ~init:() ~f:(fun dir () ->
+      load_dir_unit t ~dir:(Path.append ctx.Context.build_dir (File_tree.Dir.path dir))));
+  Hashtbl.fold t.files ~init:[] ~f:(fun ~key ~data:_ acc -> key :: acc)
+
 let dump_trace t = Trace.dump t.trace
 
-let create ~contexts ~file_tree ~rules =
-  let all_source_files =
-    File_tree.fold file_tree ~init:Pset.empty ~traverse_ignored_dirs:true
-      ~f:(fun dir acc ->
-        let path = File_tree.Dir.path dir in
-        Pset.union acc
-          (File_tree.Dir.files dir
-           |> String_set.elements
-           |> List.map ~f:(Path.relative path)
-           |> Pset.of_list))
-  in
-  let all_copy_targets =
-    List.fold_left contexts ~init:Pset.empty ~f:(fun acc (ctx : Context.t) ->
-      Pset.union acc (Pset.elements all_source_files
-                      |> List.map ~f:(Path.append ctx.build_dir)
-                      |> Pset.of_list))
-  in
-  let all_other_targets =
-    List.fold_left rules ~init:Pset.empty ~f:(fun acc { Pre_rule.targets; _ } ->
-      List.fold_left targets ~init:acc ~f:(fun acc target ->
-        Pset.add (Target.path target) acc))
-  in
-  let all_targets_by_dir = lazy (
-    Pset.elements (Pset.union all_copy_targets all_other_targets)
-    |> List.filter_map ~f:(fun path ->
-      if Path.is_root path then
-        None
-      else
-        Some (Path.parent path, path))
-    |> Pmap.of_alist_multi
-    |> Pmap.map ~f:Pset.of_list
-  ) in
+let create ~contexts ~file_tree ~gen_rules =
   let t =
     { contexts
     ; files      = Hashtbl.create 1024
     ; trace      = Trace.load ()
     ; local_mkdirs = Path.Local.Set.empty
-    ; all_targets_by_dir
-    } in
-  List.iter rules ~f:(compile_rule t ~all_targets_by_dir ~copy_source:false);
-  setup_copy_rules t ~all_targets_by_dir
-    ~all_non_target_source_files:
-      (Pset.diff all_source_files all_other_targets);
-
-  (let l = !disabled_fallback_rules in
-   disabled_fallback_rules := [];
-   List.iter l ~f:(fun rule ->
-     let disabled_for =
-       match rule.Internal_rule.fallback with
-       | No | Not_possible -> assert false
-       | Yes paths -> paths
-     in
-     let leftover_targets = Pset.diff rule.targets disabled_for in
-     if not (Pset.is_empty leftover_targets) then begin
-       let list_paths set =
-         Pset.elements set
-         |> List.map ~f:(fun p -> sprintf "- %s"
-                                    (Path.to_string_maybe_quoted
-                                       (Path.drop_optional_build_context p)))
-         |> String.concat ~sep:"\n"
-       in
-       Loc.fail (Internal_rule.loc rule ~dir:(Path.parent (Pset.choose leftover_targets)))
-         "\
-Some of the targets of this fallback rule are present in the source tree,
-and some are not. This is not allowed. Either none of the targets must
-be present in the source tree, either they must all be.
-
-The following targets are present:
-%s
-
-The following targets are not:
-%s
-"
-         (list_paths disabled_for)
-         (list_paths leftover_targets)
-     end
-   ));
-
+    ; dirs       = Hashtbl.create 1024
+    ; load_dir_stack = []
+    ; file_tree
+    ; gen_rules
+    }
+  in
   at_exit (fun () -> dump_trace t);
   Future.Scheduler.at_exit_after_waiting_for_commands Action.Promotion.finalize;
   t
-
-let remove_old_artifacts t =
-  let rec walk dir =
-    let keep =
-      if Hashtbl.mem t.files (Path.relative dir Config.jbuilder_keep_fname) then
-        true
-      else begin
-        Path.readdir dir
-        |> List.filter ~f:(fun fn ->
-            let fn = Path.relative dir fn in
-            match Unix.lstat (Path.to_string fn) with
-            | { st_kind = S_DIR; _ } ->
-              walk fn
-            | exception _ ->
-              let keep = Hashtbl.mem t.files fn in
-              if not keep then Path.unlink fn;
-              keep
-            | _ ->
-              let keep = Hashtbl.mem t.files fn in
-              if not keep then Path.unlink fn;
-              keep)
-        |> function
-        | [] -> false
-        | _  -> true
-      end
-    in
-    if not keep then Path.rmdir dir;
-    keep
-  in
-  let walk dir =
-    if Path.exists dir then ignore (walk dir : bool)
-  in
-  List.iter t.contexts ~f:(fun (ctx : Context.t) ->
-    walk ctx.build_dir;
-    walk (Config.local_install_dir ~context:ctx.name);
-  )
 
 let eval_request t ~request ~process_target =
   let { Build_interpret.Static_deps.
         rule_deps
       ; action_deps = static_deps
-      } = Build_interpret.static_deps request ~all_targets_by_dir:t.all_targets_by_dir
+      } = Build_interpret.static_deps request ~all_targets:(load_dir t)
   in
 
   let process_targets ts =
@@ -744,7 +795,6 @@ let eval_request t ~request ~process_target =
   >>| fun ((), ()) -> ()
 
 let do_build_exn t ~request =
-  remove_old_artifacts t;
   eval_request t ~request ~process_target:(fun fn ->
     wait_for_file t fn ~targeting:fn)
 
@@ -791,7 +841,7 @@ let static_deps_of_request t request =
   let { Build_interpret.Static_deps.
         rule_deps
       ; action_deps
-      } = Build_interpret.static_deps request ~all_targets_by_dir:t.all_targets_by_dir
+      } = Build_interpret.static_deps request ~all_targets:(load_dir t)
   in
   Pset.elements (Pset.union rule_deps action_deps)
 
@@ -921,3 +971,43 @@ let build_rules ?(recursive=false) t ~request =
     die "dependency cycle detected:\n   %s"
       (List.map cycle ~f:(fun rule -> Path.to_string (Pset.choose rule.Rule.targets))
        |> String.concat ~sep:"\n-> ")
+
+(* +-----------------------------------------------------------------+
+   | Adding rules to the system                                      |
+   +-----------------------------------------------------------------+ *)
+
+let add_rule t (rule : Build_interpret.Rule.t) =
+  let dir = rule.dir in
+  match get_dir_status t ~dir with
+  | Collecting_rules collector ->
+    collector.rules <- rule :: collector.rules
+  | Loaded _ ->
+    Sexp.code_error "Build_system.add_rule called on closed directory"
+      [ "dir", Path.sexp_of_t dir
+      ; "targets", Sexp.To_sexp.list Path.sexp_of_t
+                     (List.map rule.targets ~f:Build_interpret.Target.path)
+      ]
+
+let on_load_dir t ~dir ~f =
+  match get_dir_status t ~dir with
+  | Loaded _ ->
+    Sexp.code_error "Build_system.on_dir_load called on closed directory"
+      [ "dir", Path.sexp_of_t dir ]
+  | Collecting_rules collector ->
+    match collector.stage with
+    | Loading -> f ()
+    | Pending p -> p.lazy_generators <- f :: p.lazy_generators
+
+let eval_glob t ~dir re =
+  let targets = load_dir t ~dir |> Pset.elements |> List.map ~f:Path.basename in
+  let files =
+    match File_tree.find_dir t.file_tree dir with
+    | None -> targets
+    | Some d ->
+      String_set.union (String_set.of_list targets) (File_tree.Dir.files d)
+      |> String_set.elements
+  in
+  List.filter files ~f:(Re.execp re)
+
+let targets_of = load_dir
+let load_dir = load_dir_unit

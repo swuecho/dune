@@ -62,13 +62,16 @@ module Store : sig
 
   val pp : t Fmt.t
 
-  val create : unit -> t
+  val create : Build_system.t -> t
 
   val unlink : t -> string list -> unit
 end
 
-(** [add_build store alias deps] arrange things so that all [deps] are built as part of
-    the build of alias [alias]. *)
+(** Alias depending on all files of [dir] with extension [ext]. *)
+val files_of : Store.t -> dir:Path.t -> ext:string -> t
+
+(** [add_deps store alias deps] arrange things so that all [deps] are built as part of the
+    build of alias [alias]. *)
 val add_deps : Store.t -> t -> Path.t list -> unit
 
 (** [add_build store alias ~stamp build] arrange things so that [build] is part of the
@@ -93,3 +96,4 @@ val add_builds
 
 val rules : Store.t -> Build_interpret.Rule.t list
 
+val gen_rules : Store.t -> context_names:string list -> Path.t -> unit

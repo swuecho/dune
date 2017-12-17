@@ -4,11 +4,48 @@ open! Import
 
 type t
 
+(** Create a new build system. [file_tree] represent the source
+    tree. [gen_rules] is used to generate the rules for a given
+    directory.
+
+    It is expected that [gen_rules] only generate rules whose targets
+    are descendant of [dir].
+*)
 val create
   :  contexts:Context.t list
   -> file_tree:File_tree.t
-  -> rules:Build_interpret.Rule.t list
+  -> gen_rules:(t -> dir:Path.t -> unit)
   -> t
+
+(** Changes the rule generator callback *)
+val set_rule_generator : t -> f:(t -> dir:Path.t -> unit) -> unit
+
+(** Add a rule to the system. This function must be called from the [gen_rules]
+    callback. All the target of the rule must be in the same directory.
+
+    Assuming that [gen_rules ~dir:a] calls [add_rule r] where [r.dir] is [Some b], one of
+    the following assumption must hold:
+
+    - [a] and [b] are the same
+    - [gen_rules ~dir:b] calls [load_dir ~dir:a]
+
+    The call to [load_dir ~dir:a] from [gen_rules ~dir:b] declares a directory dependency
+    from [b] to [a]. There must be no cyclic directory dependencies.
+*)
+val add_rule : t -> Build_interpret.Rule.t -> unit
+
+(** [eval_glob t ~dir re ~f] returns the list of files in [dir] that matches [re] to
+    [f]. The list of files includes the list of targets. *)
+val eval_glob : t -> dir:Path.t -> Re.re -> string list
+
+(** Returns the set of targets in the given directory. *)
+val targets_of : t -> dir:Path.t -> Path.Set.t
+
+(** Load the rules for this directory. *)
+val load_dir : t -> dir:Path.t -> unit
+
+(** [on_load_dir ~dir ~f] remembers to run [f] when loading the rules for [dir]. *)
+val on_load_dir : t -> dir:Path.t -> f:(unit -> unit) -> unit
 
 val is_target : t -> Path.t -> bool
 

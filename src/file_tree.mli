@@ -34,6 +34,8 @@ val root : t -> Dir.t
 
 val find_dir : t -> Path.t -> Dir.t option
 
+val files_of : t -> Path.t -> Path.Set.t
+
 val exists : t -> Path.t -> bool
 val file_exists : t -> Path.t -> string -> bool
 

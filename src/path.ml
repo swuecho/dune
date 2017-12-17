@@ -223,7 +223,9 @@ let compare = String.compare
 module Set = struct
   include String_set
   let sexp_of_t t = Sexp.To_sexp.(list string) (String_set.elements t)
+  let of_string_set = map
 end
+
 module Map = String_map
 
 module Kind = struct
@@ -384,6 +386,18 @@ let drop_optional_build_context t =
   match extract_build_context t with
   | None -> t
   | Some (_, t) -> t
+
+let explode t =
+  if is_local t then
+    Some (String.split t ~on:'/')
+  else
+    None
+
+let explode_exn t =
+  if is_local t then
+    String.split t ~on:'/'
+  else
+    Sexp.code_error "Path.explode_exn" ["path", Atom t]
 
 let exists t = Sys.file_exists (to_string t)
 let readdir t = Sys.readdir (to_string t) |> Array.to_list

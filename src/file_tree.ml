@@ -89,6 +89,12 @@ let fold t ~traverse_ignored_dirs ~init ~f =
 let find_dir t path =
   Path.Map.find path t.dirs
 
+let files_of t path =
+  match find_dir t path with
+  | None -> Path.Set.empty
+  | Some dir ->
+    Path.Set.of_string_set (Dir.files dir) ~f:(Path.relative path)
+
 let file_exists t path fn =
   match Path.Map.find path t.dirs with
   | None -> false

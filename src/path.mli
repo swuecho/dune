@@ -42,8 +42,11 @@ val compare : t -> t -> int
 module Set : sig
   include Set.S with type elt = t
   val sexp_of_t : t Sexp.To_sexp.t
+  val of_string_set : f:(string -> elt) -> String_set.t -> t
 end
+
 module Map : Map.S with type key = t
+
 
 val kind : t -> Kind.t
 
@@ -102,6 +105,9 @@ val drop_build_context : t -> t option
 
 (** Drop the "_build/blah" prefix if present, return [t] otherwise *)
 val drop_optional_build_context : t -> t
+
+val explode : t -> string list option
+val explode_exn : t -> string list
 
 val is_in_build_dir : t -> bool
 
