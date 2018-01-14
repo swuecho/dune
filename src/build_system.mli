@@ -9,8 +9,7 @@ type t
     directory.
 
     It is expected that [gen_rules] only generate rules whose targets
-    are descendant of [dir].
-*)
+    are descendant of [dir]. *)
 val create
   :  contexts:Context.t list
   -> file_tree:File_tree.t

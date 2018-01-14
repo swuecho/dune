@@ -147,6 +147,9 @@ type t =
   ; mutable dirs : (Path.t, Dir_status.t) Hashtbl.t
   ; mutable gen_rules : (t -> dir:Path.t -> unit)
   ; mutable load_dir_stack : Path.t list
+  ; (* Set of directories under _build that have at least one rule and
+       all their ancestors. *)
+    mutable build_dirs_to_keep : Path.Set.t
   }
 
 let set_rule_generator t ~f = t.gen_rules <- f
@@ -576,7 +579,7 @@ and load_dir t ~dir =
           let path = Target.path target in
           Pset.add path acc))
     in
-    let targets, to_copy =
+    let targets, to_copy, subdirs_deletion =
       match Path.extract_build_context_dir dir with
       | None ->
         let files =
@@ -588,15 +591,26 @@ and load_dir t ~dir =
             | files ->
               Pset.of_list (List.map files ~f:(Path.relative dir))
         in
-        (Pset.union user_rule_targets files, None)
+        (Pset.union user_rule_targets files, None, Keep_all)
       | Some (ctx_path, path) ->
-        let files = File_tree.files_of t.file_tree path in
-        if Pset.is_empty files then
-          (user_rule_targets, None)
-        else
-          (Pset.union user_rule_targets
-             (Pset.map files ~f:(Path.append ctx_path)),
-           Some (ctx_path, files))
+        match Path.basename ctx_path with
+        | "install" ->
+          (user_rule_targets, None, Delete_all_unkown)
+        | ".aliases" ->
+          (user_rule_targets, None,
+           Keep_these
+             (let path = Path.drop_build_context path in
+              match File_tree.find_dir t.file_tree path with
+              | None -> String_set.empty
+              | 
+          
+          let files = File_tree.files_of t.file_tree path in
+          if Pset.is_empty files then
+            (user_rule_targets, None)
+          else
+            (Pset.union user_rule_targets
+               (Pset.map files ~f:(Path.append ctx_path)),
+             Some (ctx_path, files))
     in
 
     (* Set the directory status to loaded *)
@@ -976,11 +990,22 @@ let build_rules ?(recursive=false) t ~request =
    | Adding rules to the system                                      |
    +-----------------------------------------------------------------+ *)
 
+let rec add_build_dir_to_keep t ~dir =
+  if not (Pset.mem dir t.build_dirs_to_keep) then begin
+    t.build_dirs_to_keep <- Pset.add dir t.build_dirs_to_keep;
+    let dir = Path.parent dir in
+    if dir <> Path.root then
+      add_build_dir_to_keep t ~dir
+  end
+
 let add_rule t (rule : Build_interpret.Rule.t) =
   let dir = rule.dir in
   match get_dir_status t ~dir with
   | Collecting_rules collector ->
-    collector.rules <- rule :: collector.rules
+    let rules = collectors.rules in
+    if rules = [] && Path.is_in_build_dir dir then
+      add_build_dir_to_keep t ~dir;
+    collector.rules <- rule :: rules
   | Loaded _ ->
     Sexp.code_error "Build_system.add_rule called on closed directory"
       [ "dir", Path.sexp_of_t dir
@@ -996,7 +1021,13 @@ let on_load_dir t ~dir ~f =
   | Collecting_rules collector ->
     match collector.stage with
     | Loading -> f ()
-    | Pending p -> p.lazy_generators <- f :: p.lazy_generators
+    | Pending p ->
+      let lazy_generators = p.lazy_generators in
+      if lazy_generators = [] &&
+         collector.rules = [] &&
+         Path.is_in_build_dir dir then
+        add_build_dir_to_keep t ~dir;
+      p.lazy_generators <- f :: lazy_generators
 
 let eval_glob t ~dir re =
   let targets = load_dir t ~dir |> Pset.elements |> List.map ~f:Path.basename in
